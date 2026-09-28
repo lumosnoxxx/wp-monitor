@@ -1,4 +1,7 @@
-"""Small web interface: shows the database, edits sites.txt, runs checks.
+"""Small web interface.
+
+  /        dashboard: status of every site, "Check" buttons (all sites or one site)
+  /admin   admin section: add, edit and delete the sites in sites.txt
 
 Standard library only. Every change goes through a POST form protected by a
 per-run token, and (when bound to localhost) the Host header is verified.
@@ -37,6 +40,10 @@ body { margin:0; padding:24px 16px; background:var(--bg); color:var(--text);
 main { max-width:1040px; margin:0 auto; }
 .card { background:var(--card); border:1px solid var(--line); border-radius:12px; margin-bottom:16px; }
 header.card { padding:20px 24px; }
+.nav { display:flex; gap:6px; margin-bottom:16px; }
+.nav a { text-decoration:none; padding:6px 14px; border-radius:8px; color:var(--muted); font-weight:600; }
+.nav a.active { background:var(--card); color:var(--text); border:1px solid var(--line); padding:5px 13px; }
+h1 { font-size:22px; margin:0 0 4px; }
 .top { display:flex; justify-content:space-between; gap:16px; align-items:flex-start; flex-wrap:wrap; }
 .label { color:var(--muted); font-size:13px; text-transform:uppercase; letter-spacing:.05em; }
 .version { font-size:40px; font-weight:700; line-height:1.1; }
@@ -72,18 +79,12 @@ details.edit summary { list-style:none; }
 details.edit summary::-webkit-details-marker { display:none; }
 details.edit form { display:flex; gap:6px; margin-top:6px; }
 details.edit input { min-width:300px; }
+.section-title { padding:14px 16px 0; font-weight:600; }
+.section-note { padding:0 16px 10px; color:var(--muted); font-size:13px; }
 .empty { padding:32px; text-align:center; color:var(--muted); }
 """
 
-SCRIPT = """
-setTimeout(function tick() {
-  var typing = [].some.call(document.querySelectorAll('input[type=text]'),
-                             function (i) { return i.value !== i.defaultValue; });
-  var busy = document.querySelector('details[open]') || typing ||
-             document.activeElement.tagName === 'INPUT';
-  if (busy) { setTimeout(tick, __MS__); } else { location.reload(); }
-}, __MS__);
-"""
+RELOAD_SCRIPT = "setTimeout(function () { location.reload(); }, __MS__);"
 
 
 # ---------------------------------------------------------------- data
@@ -115,7 +116,7 @@ def build_entries(conn, sites_file):
                             "detail": r["detail"] or ""})
         else:
             entries.append({"site": site, "in_file": True, "version": "", "status": "NOT CHECKED",
-                            "last_checked": "-", "detail": "Run the checks to get a status"})
+                            "last_checked": "-", "detail": "Run a check to get a status"})
     for site, r in rows.items():
         entries.append({"site": site, "in_file": False, "version": r["version"],
                         "status": r["status"], "last_checked": r["last_checked"],
@@ -125,19 +126,42 @@ def build_entries(conn, sites_file):
 
 # ---------------------------------------------------------------- rendering
 
-def _row(e, csrf):
+def _layout(title, active, body, flashes, script=""):
+    esc = html.escape
+    nav = "".join(
+        f'<a href="{href}"{" class=active" if key == active else ""}>{label}</a>'
+        for key, href, label in (("dash", "/", "Dashboard"), ("admin", "/admin", "Manage sites"))
+    )
+    flash_html = "".join(f'<div class="flash {k}">{esc(t)}</div>' for k, t in flashes)
+    script_tag = f"<script>{script}</script>" if script else ""
+    return f"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{esc(title)}</title>
+<style>{CSS}</style>
+</head><body><main>
+<nav class="nav">{nav}</nav>
+{flash_html}
+{body}
+</main>{script_tag}</body></html>"""
+
+
+def _csrf(token):
+    return f'<input type="hidden" name="csrf" value="{html.escape(token)}">'
+
+
+def _dash_row(e, csrf, state):
     esc = html.escape
     site = esc(e["site"])
-    if e["in_file"]:
-        edit = f"""<details class="edit"><summary class="btn">Edit</summary>
-<form method="post" action="/sites/edit">{csrf}<input type="hidden" name="old" value="{site}">
-<input type="text" name="url" value="{site}" required maxlength="2048">
-<button class="btn primary">Save</button></form></details>"""
-        del_label = "Delete"
+    running = state["running"]
+    if running and state["target"] == e["site"]:
+        check = '<button class="btn" disabled>Checking...</button>'
     else:
-        edit, del_label = "", "Remove"
-    delete = f"""<form method="post" action="/sites/delete" onsubmit="return confirm('Delete this site?')">{csrf}
-<input type="hidden" name="url" value="{site}"><button class="btn danger">{del_label}</button></form>"""
+        disabled = " disabled" if running else ""
+        check = f'<button class="btn"{disabled}>Check</button>'
+    check_form = (f'<form method="post" action="/check/site">{csrf}'
+                  f'<input type="hidden" name="url" value="{site}">{check}</form>')
     return (
         "<tr>"
         f'<td><a href="{site}" target="_blank" rel="noopener noreferrer">{site}</a></td>'
@@ -145,14 +169,14 @@ def _row(e, csrf):
         f'<td><span class="badge {_status_class(e["status"])}">{esc(e["status"])}</span></td>'
         f'<td>{esc(e["last_checked"])}</td>'
         f'<td>{esc(e["detail"])}</td>'
-        f'<td><div class="actions">{edit}{delete}</div></td>'
+        f'<td>{check_form}</td>'
         "</tr>"
     )
 
 
-def render_page(entries, last_check, state, token, flashes):
+def render_dashboard(entries, last_check, state, token, flashes):
     esc = html.escape
-    csrf = f'<input type="hidden" name="csrf" value="{esc(token)}">'
+    csrf = _csrf(token)
     entries = sorted(entries, key=_sort_key)
 
     latest = esc(last_check["latest"]) if last_check else "-"
@@ -162,37 +186,27 @@ def render_page(entries, last_check, state, token, flashes):
     for e in entries:
         counts[_status_class(e["status"])] += 1
 
+    status_line = ""
     if state["running"]:
-        status_line = '<div class="meta">Check in progress...</div>'
+        what = f"Checking {esc(state['target'])}..." if state["target"] else "Check in progress..."
+        status_line = f'<div class="meta">{what}</div>'
         button = '<button class="btn primary" disabled>Check running...</button>'
     else:
-        status_line = ""
         if state["last_error"]:
-            status_line = f'<div class="meta err">Last manual check failed: {esc(state["last_error"])}</div>'
-        button = '<button class="btn primary">Run checks now</button>'
+            status_line = f'<div class="meta err">Last check failed: {esc(state["last_error"])}</div>'
+        button = '<button class="btn primary">Check all sites</button>'
 
     pending = f'<span class="badge muted">{counts["muted"]} not checked</span>' if counts["muted"] else ""
-    flash_html = "".join(f'<div class="flash {k}">{esc(t)}</div>' for k, t in flashes)
 
     if entries:
-        rows = "".join(_row(e, csrf) for e in entries)
+        rows = "".join(_dash_row(e, csrf, state) for e in entries)
         table = ('<div class="table-wrap"><table><thead><tr><th>Site</th><th>Version</th><th>Status</th>'
-                 '<th>Last checked (UTC)</th><th>Detail</th><th>Actions</th></tr></thead>'
+                 '<th>Last checked (UTC)</th><th>Detail</th><th></th></tr></thead>'
                  f"<tbody>{rows}</tbody></table></div>")
     else:
-        table = '<div class="empty">No sites yet. Add one above.</div>'
+        table = '<div class="empty">No sites yet. Add some in <a href="/admin">Manage sites</a>.</div>'
 
-    ms = REFRESH_RUNNING_MS if state["running"] else REFRESH_IDLE_MS
-    script = SCRIPT.replace("__MS__", str(ms))
-
-    return f"""<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>WordPress monitor</title>
-<style>{CSS}</style>
-</head><body><main>
-<header class="card">
+    body = f"""<header class="card">
   <div class="top">
     <div>
       <div class="label">Latest WordPress release</div>
@@ -209,7 +223,52 @@ def render_page(entries, last_check, state, token, flashes):
     {pending}
   </div>
 </header>
-{flash_html}
+<div class="card">{table}</div>"""
+
+    ms = REFRESH_RUNNING_MS if state["running"] else REFRESH_IDLE_MS
+    return _layout("WordPress monitor", "dash", body, flashes, RELOAD_SCRIPT.replace("__MS__", str(ms)))
+
+
+def _admin_row(site, in_file, csrf):
+    esc = html.escape
+    s = esc(site)
+    if in_file:
+        edit = f"""<details class="edit"><summary class="btn">Edit</summary>
+<form method="post" action="/sites/edit">{csrf}<input type="hidden" name="old" value="{s}">
+<input type="text" name="url" value="{s}" required maxlength="2048">
+<button class="btn primary">Save</button></form></details>"""
+        label = "Delete"
+    else:
+        edit, label = "", "Remove"
+    delete = (f'<form method="post" action="/sites/delete" onsubmit="return confirm(\'{label} this site?\')">'
+              f'{csrf}<input type="hidden" name="url" value="{s}">'
+              f'<button class="btn danger">{label}</button></form>')
+    return (f'<tr><td><a href="{s}" target="_blank" rel="noopener noreferrer">{s}</a></td>'
+            f'<td><div class="actions">{edit}{delete}</div></td></tr>')
+
+
+def render_admin(sites, orphans, token, flashes):
+    csrf = _csrf(token)
+
+    if sites:
+        rows = "".join(_admin_row(s, True, csrf) for s in sites)
+        table = ('<div class="table-wrap"><table><thead><tr><th>Site</th><th>Actions</th></tr></thead>'
+                 f"<tbody>{rows}</tbody></table></div>")
+    else:
+        table = '<div class="empty">No sites yet. Add one above.</div>'
+
+    orphan_html = ""
+    if orphans:
+        rows = "".join(_admin_row(s, False, csrf) for s in orphans)
+        orphan_html = f"""<div class="card">
+  <div class="section-title">Old results</div>
+  <div class="section-note">These sites have saved results but are no longer in the sites file.</div>
+  <div class="table-wrap"><table><tbody>{rows}</tbody></table></div>
+</div>"""
+
+    body = f"""<h1>Manage sites</h1>
+<div class="meta" style="margin:0 0 12px">Changes are written to the sites file.
+Newly added or edited sites are checked from the dashboard.</div>
 <div class="card">
   <form class="add" method="post" action="/sites/add">{csrf}
     <input type="text" name="url" placeholder="https://example.com" required maxlength="2048">
@@ -217,7 +276,8 @@ def render_page(entries, last_check, state, token, flashes):
   </form>
 </div>
 <div class="card">{table}</div>
-</main><script>{script}</script></body></html>"""
+{orphan_html}"""
+    return _layout("Manage sites - WordPress monitor", "admin", body, flashes)
 
 
 # ---------------------------------------------------------------- server
@@ -257,24 +317,13 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
-    def _redirect(self):
+    def _redirect(self, location):
         self.send_response(303)
-        self.send_header("Location", "/")
+        self.send_header("Location", location)
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    # ----- GET
-    def do_GET(self):
-        if not self._host_ok():
-            return
-        if self.path.split("?")[0] not in ("/", "/index.html"):
-            self.send_error(404)
-            return
-        app = self.app
-        with closing(storage.connect(app.db_path)) as conn:
-            entries = build_entries(conn, app.sites_file)
-            last = storage.get_last_check(conn)
-        page = render_page(entries, last, app.runner.snapshot(), app.token, app.pop_flashes())
+    def _send_page(self, page):
         data = page.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -283,6 +332,27 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
         self.end_headers()
         self.wfile.write(data)
+
+    # ----- GET
+    def do_GET(self):
+        if not self._host_ok():
+            return
+        path = self.path.split("?")[0]
+        app = self.app
+        if path in ("/", "/index.html"):
+            with closing(storage.connect(app.db_path)) as conn:
+                entries = build_entries(conn, app.sites_file)
+                last = storage.get_last_check(conn)
+            self._send_page(render_dashboard(entries, last, app.runner.snapshot(),
+                                             app.token, app.pop_flashes()))
+        elif path == "/admin":
+            with closing(storage.connect(app.db_path)) as conn:
+                entries = build_entries(conn, app.sites_file)
+            sites = sorted(e["site"] for e in entries if e["in_file"])
+            orphans = sorted(e["site"] for e in entries if not e["in_file"])
+            self._send_page(render_admin(sites, orphans, app.token, app.pop_flashes()))
+        else:
+            self.send_error(404)
 
     # ----- POST
     def do_POST(self):
@@ -303,13 +373,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(403, "Invalid form token. Reload the page and try again.")
             return
 
+        path = self.path.split("?")[0]
         actions = {
             "/sites/add": self._add,
             "/sites/edit": self._edit,
             "/sites/delete": self._delete,
-            "/check": self._check,
+            "/check": self._check_all,
+            "/check/site": self._check_one,
         }
-        action = actions.get(self.path.split("?")[0])
+        action = actions.get(path)
         if action is None:
             self.send_error(404)
             return
@@ -319,11 +391,12 @@ class Handler(BaseHTTPRequestHandler):
             self.app.flash("err", str(e))
         except OSError as e:
             self.app.flash("err", f"File error: {e}")
-        self._redirect()
+        # site management goes back to the admin page, checks back to the dashboard
+        self._redirect("/admin" if path.startswith("/sites/") else "/")
 
     def _add(self, field):
         url = add_site(self.app.sites_file, field("url"))
-        self.app.flash("ok", f"Added {url}. Run the checks to get its status.")
+        self.app.flash("ok", f"Added {url}. Check it from the dashboard.")
 
     def _edit(self, field):
         old = field("old")
@@ -331,7 +404,7 @@ class Handler(BaseHTTPRequestHandler):
         if new != old:
             with closing(storage.connect(self.app.db_path)) as conn:
                 storage.delete_site(conn, old)      # the old status no longer applies
-            self.app.flash("ok", f"Updated to {new}. Run the checks to get its status.")
+            self.app.flash("ok", f"Updated to {new}. Check it from the dashboard.")
         else:
             self.app.flash("ok", "No change.")
 
@@ -345,11 +418,22 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.app.flash("err", "Site not found.")
 
-    def _check(self, field):
+    def _check_all(self, field):
         if not read_sites(self.app.sites_file):
-            self.app.flash("err", "No sites to check. Add one first.")
+            self.app.flash("err", "No sites to check. Add one in Manage sites.")
         elif self.app.runner.start():
             self.app.flash("ok", "Check started. The page refreshes while it runs.")
+        else:
+            self.app.flash("err", "A check is already running.")
+
+    def _check_one(self, field):
+        url = field("url")
+        with closing(storage.connect(self.app.db_path)) as conn:
+            known = set(read_sites(self.app.sites_file)) | {r["site"] for r in storage.get_all(conn)}
+        if url not in known:      # only sites we already manage can be checked
+            self.app.flash("err", "Unknown site.")
+        elif self.app.runner.start(url):
+            self.app.flash("ok", f"Checking {url}...")
         else:
             self.app.flash("err", "A check is already running.")
 

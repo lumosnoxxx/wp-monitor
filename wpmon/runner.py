@@ -31,29 +31,34 @@ def run_check(db_path, sites, workers=config.MAX_WORKERS):
 
 
 class BackgroundCheck:
-    """Runs one check at a time in a background thread."""
+    """Runs one check at a time (all sites, or a single site) in a background thread."""
 
     def __init__(self, db_path, sites_file):
         self.db_path = db_path
         self.sites_file = sites_file
         self._lock = threading.Lock()
         self._running = False
+        self._target = None          # the single site being checked, None = all sites
         self._last_error = None
 
-    def start(self):
-        """Start a check. Returns False if one is already running."""
+    def start(self, site=None):
+        """Start a check of `site`, or of every site in the file if `site` is None.
+
+        Returns False if a check is already running.
+        """
         with self._lock:
             if self._running:
                 return False
             self._running = True
+            self._target = site
             self._last_error = None
-        threading.Thread(target=self._work, daemon=True).start()
+        threading.Thread(target=self._work, args=(site,), daemon=True).start()
         return True
 
-    def _work(self):
+    def _work(self, site):
         error = None
         try:
-            sites = read_sites(self.sites_file)
+            sites = [site] if site else read_sites(self.sites_file)
             if not sites:
                 raise RuntimeError("No sites to check.")
             run_check(self.db_path, sites)
@@ -62,7 +67,9 @@ class BackgroundCheck:
         with self._lock:
             self._last_error = error
             self._running = False
+            self._target = None
 
     def snapshot(self):
         with self._lock:
-            return {"running": self._running, "last_error": self._last_error}
+            return {"running": self._running, "target": self._target,
+                    "last_error": self._last_error}
