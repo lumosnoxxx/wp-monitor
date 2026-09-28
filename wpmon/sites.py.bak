@@ -1,0 +1,31 @@
+"""Reading and cleaning the list of sites to check."""
+
+import sys
+from pathlib import Path
+
+
+def normalize_url(url):
+    url = url.strip()
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    return url.rstrip("/")
+
+
+def load_sites(cli_sites, file_path):
+    """Sites given on the command line win over the sites file."""
+    if cli_sites:
+        raw = cli_sites
+    else:
+        path = Path(file_path)
+        if not path.exists():
+            sys.exit(f"Sites file '{path}' not found. Create it with one URL per line.")
+        lines = [l.strip() for l in path.read_text().splitlines()]
+        raw = [l for l in lines if l and not l.startswith("#")]
+
+    seen, sites = set(), []
+    for url in raw:
+        url = normalize_url(url)
+        if url not in seen:
+            seen.add(url)
+            sites.append(url)
+    return sites

@@ -1,0 +1,141 @@
+"""Tiny read-only web page showing the content of the database.
+
+Uses only the standard library. The page reads the SQLite database on every
+request, so it always shows the result of the last `check`.
+"""
+
+import html
+from contextlib import closing
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from . import storage
+
+REFRESH_SECONDS = 60
+
+CSS = """
+:root { --bg:#f6f7f9; --card:#fff; --text:#1c2430; --muted:#6b7686; --line:#e3e7ed;
+        --ok:#1a7f4b; --ok-bg:#e3f4ea; --bad:#b42318; --bad-bg:#fde8e6;
+        --warn:#9a6700; --warn-bg:#fff3cd; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg:#12161c; --card:#1b212a; --text:#e6eaf0; --muted:#8b96a5; --line:#2a323d;
+          --ok:#5fd394; --ok-bg:#12301f; --bad:#ff8a80; --bad-bg:#3a1a17;
+          --warn:#f5c451; --warn-bg:#382d0f; }
+}
+* { box-sizing: border-box; }
+body { margin:0; padding:24px 16px; background:var(--bg); color:var(--text);
+       font:15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+main { max-width:960px; margin:0 auto; }
+header { background:var(--card); border:1px solid var(--line); border-radius:12px;
+         padding:20px 24px; margin-bottom:16px; }
+header .label { color:var(--muted); font-size:13px; text-transform:uppercase; letter-spacing:.05em; }
+header .version { font-size:40px; font-weight:700; line-height:1.1; }
+header .meta { color:var(--muted); font-size:13px; margin-top:6px; }
+.counts { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
+.table-wrap { background:var(--card); border:1px solid var(--line); border-radius:12px; overflow-x:auto; }
+table { width:100%; border-collapse:collapse; }
+th, td { text-align:left; padding:10px 16px; border-bottom:1px solid var(--line); white-space:nowrap; }
+th { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.05em; }
+tr:last-child td { border-bottom:none; }
+a { color:inherit; }
+.badge { display:inline-block; padding:2px 10px; border-radius:999px; font-size:13px; font-weight:600; }
+.ok { color:var(--ok); background:var(--ok-bg); }
+.bad { color:var(--bad); background:var(--bad-bg); }
+.warn { color:var(--warn); background:var(--warn-bg); }
+.empty { padding:32px; text-align:center; color:var(--muted); }
+"""
+
+
+def _status_class(status):
+    if status in ("UP-TO-DATE", "AHEAD"):
+        return "ok"
+    if status.startswith("OUTDATED") or status == "ERROR":
+        return "bad"
+    return "warn"  # UNKNOWN
+
+
+def _sort_key(row):
+    # problems first, then unknown, then fine; alphabetical inside each group
+    rank = {"bad": 0, "warn": 1, "ok": 2}[_status_class(row["status"])]
+    return (rank, row["site"])
+
+
+def render_page(rows, last_check):
+    esc = html.escape
+    rows = sorted(rows, key=_sort_key)
+
+    latest = esc(last_check["latest"]) if last_check else "-"
+    checked = esc(last_check["last_checked"]) if last_check else "never"
+
+    counts = {"ok": 0, "bad": 0, "warn": 0}
+    for r in rows:
+        counts[_status_class(r["status"])] += 1
+
+    if rows:
+        body_rows = "".join(
+            "<tr>"
+            f'<td><a href="{esc(r["site"], quote=True)}" target="_blank" rel="noopener noreferrer">{esc(r["site"])}</a></td>'
+            f'<td>{esc(r["version"]) or "-"}</td>'
+            f'<td><span class="badge {_status_class(r["status"])}">{esc(r["status"])}</span></td>'
+            f'<td>{esc(r["last_checked"])}</td>'
+            f'<td>{esc(r["detail"] or "")}</td>'
+            "</tr>"
+            for r in rows
+        )
+        table = (
+            '<div class="table-wrap"><table><thead><tr>'
+            "<th>Site</th><th>Version</th><th>Status</th><th>Last checked (UTC)</th><th>Detail</th>"
+            f"</tr></thead><tbody>{body_rows}</tbody></table></div>"
+        )
+    else:
+        table = '<div class="table-wrap"><div class="empty">No data yet. Run <code>python main.py check</code> first.</div></div>'
+
+    return f"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="{REFRESH_SECONDS}">
+<title>WordPress monitor</title>
+<style>{CSS}</style>
+</head><body><main>
+<header>
+  <div class="label">Latest WordPress release</div>
+  <div class="version">{latest}</div>
+  <div class="meta">Last check: {checked} UTC</div>
+  <div class="counts">
+    <span class="badge ok">{counts["ok"]} up to date</span>
+    <span class="badge bad">{counts["bad"]} outdated / error</span>
+    <span class="badge warn">{counts["warn"]} unknown</span>
+  </div>
+</header>
+{table}
+</main></body></html>"""
+
+
+def make_handler(db_path):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.split("?")[0] not in ("/", "/index.html"):
+                self.send_error(404)
+                return
+            # one connection per request: sqlite connections can't cross threads
+            with closing(storage.connect(db_path)) as conn:
+                page = render_page(storage.get_all(conn), storage.get_last_check(conn))
+            data = page.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    return Handler
+
+
+def serve(db_path, host="127.0.0.1", port=8000):
+    server = ThreadingHTTPServer((host, port), make_handler(db_path))
+    print(f"Serving on http://{host}:{port}  (Ctrl+C to stop)")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        server.server_close()

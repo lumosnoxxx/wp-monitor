@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.tmp
+*.db
+venv/
+.venv/
+sites.txt
