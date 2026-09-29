@@ -13,6 +13,7 @@ import html
 import secrets
 import threading
 from contextlib import closing
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
 
@@ -22,7 +23,7 @@ from .sites import add_site, read_sites, remove_site, update_site
 
 REFRESH_IDLE_MS = 60_000
 REFRESH_RUNNING_MS = 5_000
-MAX_BODY = 8 * 1024
+MAX_BODY = 32 * 1024   # covers the edit form: URL + name + description + responsible
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost")
 
 CSS = """
@@ -37,7 +38,7 @@ CSS = """
 * { box-sizing: border-box; }
 body { margin:0; padding:24px 16px; background:var(--bg); color:var(--text);
        font:15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-main { max-width:1040px; margin:0 auto; }
+main { max-width:1600px; margin:0 auto; }
 .card { background:var(--card); border:1px solid var(--line); border-radius:12px; margin-bottom:16px; }
 header.card { padding:20px 24px; }
 .nav { display:flex; gap:6px; margin-bottom:16px; }
@@ -64,9 +65,31 @@ input[type=text] { font:inherit; padding:6px 10px; border-radius:8px; border:1px
 .btn:disabled { opacity:.6; cursor:default; }
 .table-wrap { overflow-x:auto; }
 table { width:100%; border-collapse:collapse; }
-th, td { text-align:left; padding:10px 16px; border-bottom:1px solid var(--line); white-space:nowrap; vertical-align:top; }
-th { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.05em; }
+th, td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--line); vertical-align:top; }
+th:first-child, td:first-child { padding-left:16px; }
+th:last-child, td:last-child { padding-right:16px; }
+th { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.05em; white-space:nowrap; }
+td.site { white-space:nowrap; }
+td.detail, td.wrap { overflow-wrap:anywhere; }
+td.nw, .badge, .actions { white-space:nowrap; }
 tr:last-child td { border-bottom:none; }
+.sort { font:inherit; color:inherit; background:none; border:0; padding:0; cursor:pointer;
+        text-transform:inherit; letter-spacing:inherit; display:inline-flex; align-items:center; gap:5px; }
+.sort:hover { color:var(--text); }
+.arrow { display:inline-block; width:10px; }
+th[aria-sort=ascending] .arrow::after, th[aria-sort=descending] .arrow::after {
+  content:""; display:inline-block; border-left:4px solid transparent; border-right:4px solid transparent; }
+th[aria-sort=ascending] .arrow::after { border-bottom:5px solid currentColor; }
+th[aria-sort=descending] .arrow::after { border-top:5px solid currentColor; }
+th[aria-sort=ascending], th[aria-sort=descending] { color:var(--text); }
+.sr { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; }
+@media (max-width:720px) { .col-detail { display:none; } }
+details.edit input.wide { min-width:300px; }
+details.edit textarea { font:inherit; padding:6px 10px; border-radius:8px; border:1px solid var(--line);
+                        background:var(--bg); color:var(--text); min-width:300px; resize:vertical; }
+details.edit .field { display:flex; flex-direction:column; gap:2px; margin-top:6px; }
+details.edit .field span { font-size:12px; color:var(--muted); }
+details.edit form { flex-direction:column; align-items:flex-start; }
 a { color:inherit; }
 .badge { display:inline-block; padding:2px 10px; border-radius:999px; font-size:13px; font-weight:600; }
 .ok { color:var(--ok); background:var(--ok-bg); }
@@ -86,6 +109,79 @@ details.edit input { min-width:300px; }
 
 RELOAD_SCRIPT = "setTimeout(function () { location.reload(); }, __MS__);"
 
+# Click a column header: ascending -> descending -> back to the default order.
+# The chosen sort is kept in sessionStorage so it survives the automatic refresh.
+SORT_SCRIPT = """
+(function () {
+  var tables = document.querySelectorAll('table.sortable');
+  var KEY = 'wpmon-sort:' + location.pathname;
+
+  function cell(row, i) { var c = row.cells[i]; return c ? (c.getAttribute('data-sort') || '') : ''; }
+
+  function compare(type, a, b) {
+    if (type === 'version') {
+      var x = a.split('.'), y = b.split('.'), n = Math.max(x.length, y.length);
+      for (var i = 0; i < n; i++) {
+        var d = (parseInt(x[i], 10) || 0) - (parseInt(y[i], 10) || 0);
+        if (d) return d;
+      }
+      return 0;
+    }
+    if (type === 'num') return Number(a) - Number(b);
+    if (type === 'date') return a < b ? -1 : (a > b ? 1 : 0);
+    return a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
+  }
+
+  function apply(table, col, dir) {          // dir: ascending | descending | none
+    var body = table.tBodies[0];
+    var rows = [].slice.call(body.rows);
+    rows.forEach(function (r, n) { if (r.getAttribute('data-i') === null) r.setAttribute('data-i', n); });
+    var heads = table.tHead.rows[0].cells;
+    var type = heads[col].getAttribute('data-type');
+    var sign = dir === 'descending' ? -1 : 1;
+    rows.sort(function (r1, r2) {
+      var order = r1.getAttribute('data-i') - r2.getAttribute('data-i');
+      if (dir === 'none') return order;
+      var a = cell(r1, col), b = cell(r2, col);
+      if (a === '' && b !== '') return 1;     // empty values always go last
+      if (b === '' && a !== '') return -1;
+      return (a === '' ? 0 : compare(type, a, b) * sign) || order;
+    });
+    rows.forEach(function (r) { body.appendChild(r); });
+    for (var i = 0; i < heads.length; i++) {
+      if (heads[i].hasAttribute('data-type')) heads[i].setAttribute('aria-sort', i === col ? dir : 'none');
+    }
+  }
+
+  function save(t, col, dir) {
+    try {
+      if (dir === 'none') sessionStorage.removeItem(KEY + ':' + t);
+      else sessionStorage.setItem(KEY + ':' + t, col + ',' + dir);
+    } catch (e) {}
+  }
+
+  [].forEach.call(tables, function (table, t) {
+    var heads = table.tHead.rows[0].cells;
+    [].forEach.call(heads, function (th, col) {
+      var btn = th.querySelector('.sort');
+      if (!btn) return;
+      btn.addEventListener('click', function () {
+        var cur = th.getAttribute('aria-sort');
+        var next = cur === 'ascending' ? 'descending' : (cur === 'descending' ? 'none' : 'ascending');
+        apply(table, col, next);
+        save(t, col, next);
+      });
+    });
+    try {
+      var saved = (sessionStorage.getItem(KEY + ':' + t) || '').split(',');
+      var c = parseInt(saved[0], 10);
+      if (!isNaN(c) && heads[c] && heads[c].hasAttribute('data-type') &&
+          (saved[1] === 'ascending' || saved[1] === 'descending')) apply(table, c, saved[1]);
+    } catch (e) {}
+  });
+})();
+"""
+
 
 # ---------------------------------------------------------------- data
 
@@ -99,28 +195,60 @@ def _status_class(status):
     return "warn"  # UNKNOWN
 
 
+DISPLAY_TZ = timezone(timedelta(hours=3))   # dashboard shows times in UTC+3; storage stays UTC
+
+
+def _fmt_ts(value):
+    """'2026-09-28T09:09:21+00:00' -> '2026-09-28 12:09' in UTC+3 (the database keeps the UTC value)."""
+    try:
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(DISPLAY_TZ)
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except (ValueError, TypeError):
+        return value
+
+
+def _th(label, kind, cls=""):
+    """A sortable table header. `kind` tells the script how to compare the column."""
+    c = f' class="{cls}"' if cls else ""
+    return (f'<th{c} data-type="{kind}" aria-sort="none"><button type="button" class="sort">'
+            f'{label}<span class="arrow" aria-hidden="true"></span></button></th>')
+
+
+_RANK = {"bad": 0, "warn": 1, "muted": 2, "ok": 3}
+
+
 def _sort_key(e):
-    rank = {"bad": 0, "warn": 1, "muted": 2, "ok": 3}[_status_class(e["status"])]
-    return (rank, e["site"])
+    return (_RANK[_status_class(e["status"])], e["site"])
 
 
 def build_entries(conn, sites_file):
     """Sites in sites.txt (with their last status, if any) + DB rows no longer in the file."""
     rows = {r["site"]: r for r in storage.get_all(conn)}
+    meta = storage.get_all_meta(conn)
     entries = []
+
+    def with_meta(base):
+        m = meta.get(base["site"])
+        base["name"] = m["name"] if m else ""
+        base["description"] = m["description"] if m else ""
+        base["responsible"] = m["responsible"] if m else ""
+        return base
+
     for site in read_sites(sites_file):
         r = rows.pop(site, None)
         if r:
-            entries.append({"site": site, "in_file": True, "version": r["version"],
+            entries.append(with_meta({"site": site, "in_file": True, "version": r["version"],
                             "status": r["status"], "last_checked": r["last_checked"],
-                            "detail": r["detail"] or ""})
+                            "detail": r["detail"] or ""}))
         else:
-            entries.append({"site": site, "in_file": True, "version": "", "status": "NOT CHECKED",
-                            "last_checked": "-", "detail": "Run a check to get a status"})
+            entries.append(with_meta({"site": site, "in_file": True, "version": "", "status": "NOT CHECKED",
+                            "last_checked": "-", "detail": "Run a check to get a status"}))
     for site, r in rows.items():
-        entries.append({"site": site, "in_file": False, "version": r["version"],
+        entries.append(with_meta({"site": site, "in_file": False, "version": r["version"],
                         "status": r["status"], "last_checked": r["last_checked"],
-                        "detail": ((r["detail"] or "") + " (not in sites file)").strip()})
+                        "detail": ((r["detail"] or "") + " (not in sites file)").strip()}))
     return entries
 
 
@@ -162,14 +290,20 @@ def _dash_row(e, csrf, state):
         check = f'<button class="btn"{disabled}>Check</button>'
     check_form = (f'<form method="post" action="/check/site">{csrf}'
                   f'<input type="hidden" name="url" value="{site}">{check}</form>')
+    raw_ts = e["last_checked"] if e["last_checked"] != "-" else ""
     return (
         "<tr>"
-        f'<td><a href="{site}" target="_blank" rel="noopener noreferrer">{site}</a></td>'
-        f'<td>{esc(e["version"]) or "-"}</td>'
-        f'<td><span class="badge {_status_class(e["status"])}">{esc(e["status"])}</span></td>'
-        f'<td>{esc(e["last_checked"])}</td>'
-        f'<td>{esc(e["detail"])}</td>'
-        f'<td>{check_form}</td>'
+        f'<td class="site" data-sort="{esc(e["site"].lower(), quote=True)}">'
+        f'<a href="{site}" title="{site}" target="_blank" rel="noopener noreferrer">{site}</a></td>'
+        f'<td class="wrap col-detail" data-sort="{esc(e["name"].lower(), quote=True)}">{esc(e["name"]) or "-"}</td>'
+        f'<td class="nw" data-sort="{esc(e["version"] or "", quote=True)}">{esc(e["version"]) or "-"}</td>'
+        f'<td class="nw" data-sort="{_RANK[_status_class(e["status"])]}">'
+        f'<span class="badge {_status_class(e["status"])}">{esc(e["status"])}</span></td>'
+        f'<td class="nw" data-sort="{esc(raw_ts, quote=True)}">{esc(_fmt_ts(e["last_checked"]))}</td>'
+        f'<td class="wrap col-detail" data-sort="{esc(e["detail"].lower(), quote=True)}">{esc(e["detail"])}</td>'
+        f'<td class="wrap col-detail" data-sort="{esc(e["description"].lower(), quote=True)}">{esc(e["description"]) or "-"}</td>'
+        f'<td class="wrap col-detail" data-sort="{esc(e["responsible"].lower(), quote=True)}">{esc(e["responsible"]) or "-"}</td>'
+        f'<td class="nw">{check_form}</td>'
         "</tr>"
     )
 
@@ -180,7 +314,7 @@ def render_dashboard(entries, last_check, state, token, flashes):
     entries = sorted(entries, key=_sort_key)
 
     latest = esc(last_check["latest"]) if last_check else "-"
-    checked = esc(last_check["last_checked"]) if last_check else "never"
+    checked = esc(_fmt_ts(last_check["last_checked"])) if last_check else "never"
 
     counts = {"ok": 0, "bad": 0, "warn": 0, "muted": 0}
     for e in entries:
@@ -200,8 +334,12 @@ def render_dashboard(entries, last_check, state, token, flashes):
 
     if entries:
         rows = "".join(_dash_row(e, csrf, state) for e in entries)
-        table = ('<div class="table-wrap"><table><thead><tr><th>Site</th><th>Version</th><th>Status</th>'
-                 '<th>Last checked (UTC)</th><th>Detail</th><th></th></tr></thead>'
+        head = (_th("Site", "text") + _th("Name", "text")
+                + _th("Version", "version") + _th("Status", "num")
+                + _th("Last checked (UTC+3)", "date") + _th("Detail", "text", "col-detail")
+                + _th("Description", "text", "col-detail") + _th("Responsible", "text", "col-detail")
+                + '<th><span class="sr">Actions</span></th>')
+        table = (f'<div class="table-wrap"><table class="sortable"><thead><tr>{head}</tr></thead>'
                  f"<tbody>{rows}</tbody></table></div>")
     else:
         table = '<div class="empty">No sites yet. Add some in <a href="/admin">Manage sites</a>.</div>'
@@ -211,7 +349,7 @@ def render_dashboard(entries, last_check, state, token, flashes):
     <div>
       <div class="label">Latest WordPress release</div>
       <div class="version">{latest}</div>
-      <div class="meta">Last check: {checked} UTC</div>
+      <div class="meta">Last check: {checked} (UTC+3)</div>
       {status_line}
     </div>
     <form method="post" action="/check">{csrf}{button}</form>
@@ -226,40 +364,49 @@ def render_dashboard(entries, last_check, state, token, flashes):
 <div class="card">{table}</div>"""
 
     ms = REFRESH_RUNNING_MS if state["running"] else REFRESH_IDLE_MS
-    return _layout("WordPress monitor", "dash", body, flashes, RELOAD_SCRIPT.replace("__MS__", str(ms)))
+    script = RELOAD_SCRIPT.replace("__MS__", str(ms)) + SORT_SCRIPT
+    return _layout("WordPress monitor", "dash", body, flashes, script)
 
 
-def _admin_row(site, in_file, csrf):
+def _admin_row(site, in_file, meta, csrf):
     esc = html.escape
     s = esc(site)
     if in_file:
+        name = esc(meta.get("name", ""))
+        description = esc(meta.get("description", ""))
+        responsible = esc(meta.get("responsible", ""))
         edit = f"""<details class="edit"><summary class="btn">Edit</summary>
 <form method="post" action="/sites/edit">{csrf}<input type="hidden" name="old" value="{s}">
-<input type="text" name="url" value="{s}" required maxlength="2048">
-<button class="btn primary">Save</button></form></details>"""
+<div class="field"><span>URL</span><input type="text" class="wide" name="url" value="{s}" required maxlength="2048"></div>
+<div class="field"><span>Name</span><input type="text" class="wide" name="name" value="{name}" maxlength="200"></div>
+<div class="field"><span>Description</span><textarea name="description" rows="2" maxlength="2000">{description}</textarea></div>
+<div class="field"><span>Responsible</span><input type="text" class="wide" name="responsible" value="{responsible}" maxlength="200"></div>
+<button class="btn primary" style="margin-top:8px">Save</button></form></details>"""
         label = "Delete"
     else:
         edit, label = "", "Remove"
     delete = (f'<form method="post" action="/sites/delete" onsubmit="return confirm(\'{label} this site?\')">'
               f'{csrf}<input type="hidden" name="url" value="{s}">'
               f'<button class="btn danger">{label}</button></form>')
-    return (f'<tr><td><a href="{s}" target="_blank" rel="noopener noreferrer">{s}</a></td>'
+    return (f'<tr><td class="site" data-sort="{esc(site.lower(), quote=True)}">'
+            f'<a href="{s}" target="_blank" rel="noopener noreferrer">{s}</a></td>'
             f'<td><div class="actions">{edit}{delete}</div></td></tr>')
 
 
-def render_admin(sites, orphans, token, flashes):
+def render_admin(sites, orphans, meta, token, flashes):
     csrf = _csrf(token)
 
     if sites:
-        rows = "".join(_admin_row(s, True, csrf) for s in sites)
-        table = ('<div class="table-wrap"><table><thead><tr><th>Site</th><th>Actions</th></tr></thead>'
+        rows = "".join(_admin_row(s, True, meta.get(s, {}), csrf) for s in sites)
+        table = ('<div class="table-wrap"><table class="sortable"><thead><tr>'
+                 + _th("Site", "text") + '<th>Actions</th></tr></thead>'
                  f"<tbody>{rows}</tbody></table></div>")
     else:
         table = '<div class="empty">No sites yet. Add one above.</div>'
 
     orphan_html = ""
     if orphans:
-        rows = "".join(_admin_row(s, False, csrf) for s in orphans)
+        rows = "".join(_admin_row(s, False, {}, csrf) for s in orphans)
         orphan_html = f"""<div class="card">
   <div class="section-title">Old results</div>
   <div class="section-note">These sites have saved results but are no longer in the sites file.</div>
@@ -277,7 +424,7 @@ Newly added or edited sites are checked from the dashboard.</div>
 </div>
 <div class="card">{table}</div>
 {orphan_html}"""
-    return _layout("Manage sites - WordPress monitor", "admin", body, flashes)
+    return _layout("Manage sites - WordPress monitor", "admin", body, flashes, SORT_SCRIPT)
 
 
 # ---------------------------------------------------------------- server
@@ -348,9 +495,10 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/admin":
             with closing(storage.connect(app.db_path)) as conn:
                 entries = build_entries(conn, app.sites_file)
+                meta = {s: dict(r) for s, r in storage.get_all_meta(conn).items()}
             sites = sorted(e["site"] for e in entries if e["in_file"])
             orphans = sorted(e["site"] for e in entries if not e["in_file"])
-            self._send_page(render_admin(sites, orphans, app.token, app.pop_flashes()))
+            self._send_page(render_admin(sites, orphans, meta, app.token, app.pop_flashes()))
         else:
             self.send_error(404)
 
@@ -401,18 +549,25 @@ class Handler(BaseHTTPRequestHandler):
     def _edit(self, field):
         old = field("old")
         new = update_site(self.app.sites_file, old, field("url"))
-        if new != old:
-            with closing(storage.connect(self.app.db_path)) as conn:
+        name = field("name")[:200]
+        description = field("description")[:2000]
+        responsible = field("responsible")[:200]
+        with closing(storage.connect(self.app.db_path)) as conn:
+            if new != old:
                 storage.delete_site(conn, old)      # the old status no longer applies
+                storage.delete_meta(conn, old)
+            storage.save_meta(conn, new, name, description, responsible)
+        if new != old:
             self.app.flash("ok", f"Updated to {new}. Check it from the dashboard.")
         else:
-            self.app.flash("ok", "No change.")
+            self.app.flash("ok", "Saved.")
 
     def _delete(self, field):
         url = field("url")
         in_file = remove_site(self.app.sites_file, url)
         with closing(storage.connect(self.app.db_path)) as conn:
             in_db = storage.delete_site(conn, url) > 0
+            storage.delete_meta(conn, url)
         if in_file or in_db:
             self.app.flash("ok", f"Removed {url}.")
         else:

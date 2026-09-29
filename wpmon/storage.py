@@ -14,11 +14,22 @@ CREATE TABLE IF NOT EXISTS site_status (
 )
 """
 
+# User-entered info about a site: not touched by checks, edited only from the admin page.
+SCHEMA_META = """
+CREATE TABLE IF NOT EXISTS site_meta (
+    site          TEXT PRIMARY KEY,
+    name          TEXT NOT NULL DEFAULT '',
+    description   TEXT NOT NULL DEFAULT '',
+    responsible   TEXT NOT NULL DEFAULT ''
+)
+"""
+
 
 def connect(db_path):
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute(SCHEMA)
+    conn.execute(SCHEMA_META)
     conn.commit()
     return conn
 
@@ -55,5 +66,34 @@ def get_last_check(conn):
 
 def delete_site(conn, site):
     cur = conn.execute("DELETE FROM site_status WHERE site = ?", (site,))
+    conn.commit()
+    return cur.rowcount
+
+
+def get_all_meta(conn):
+    """{site: row} for every site with saved name/description/responsible."""
+    return {r["site"]: r for r in conn.execute("SELECT * FROM site_meta")}
+
+
+def get_meta(conn, site):
+    return conn.execute("SELECT * FROM site_meta WHERE site = ?", (site,)).fetchone()
+
+
+def save_meta(conn, site, name="", description="", responsible=""):
+    """Insert or replace the info for one site. Empty fields are stored as ''."""
+    conn.execute(
+        """
+        INSERT INTO site_meta (site, name, description, responsible)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(site) DO UPDATE SET
+            name = excluded.name, description = excluded.description, responsible = excluded.responsible
+        """,
+        (site, name, description, responsible),
+    )
+    conn.commit()
+
+
+def delete_meta(conn, site):
+    cur = conn.execute("DELETE FROM site_meta WHERE site = ?", (site,))
     conn.commit()
     return cur.rowcount
