@@ -272,6 +272,7 @@ def _layout(title, active, body, flashes, script=""):
 <nav class="nav">{nav}</nav>
 {flash_html}
 {body}
+<div class="footer">Made with &#129685; by Ranja ft. Claude.</div>
 </main>{script_tag}</body></html>"""
 
 
