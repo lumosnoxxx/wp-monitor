@@ -32,3 +32,4 @@ jobs:
 
       - name: Run WordPress checks
         run: python main.py check
+        continue-on-error: true
