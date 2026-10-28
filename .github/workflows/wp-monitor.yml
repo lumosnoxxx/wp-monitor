@@ -20,5 +20,15 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Configure monitored sites
+        env:
+          WP_SITES: ${{ secrets.WP_SITES }}
+        run: |
+          if [ -z "$WP_SITES" ]; then
+            echo "WP_SITES is not configured"
+            exit 1
+          fi
+          printf '%s\n' "$WP_SITES" > sites.txt
+
       - name: Run WordPress checks
         run: python main.py check
